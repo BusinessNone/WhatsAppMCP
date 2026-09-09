@@ -211,10 +211,15 @@ export class WhatsAppService {
         : "";
     const combined = `${message} ${payloadText}`.toLowerCase();
 
+    // Only escalate to a full app-state recovery on a GENUINE corruption
+    // signal (a missing key while decoding a mutation). Baileys logs
+    // "failed to sync state from version" routinely during normal app-state
+    // sync and self-heals; treating that alone as corruption forced a
+    // destroy+reinit resync that tore down healthy sessions and dropped the
+    // pairing back to the QR screen.
     if (
-      combined.includes("failed to sync state from version") ||
-      (combined.includes("failed to find key") &&
-        combined.includes("decode mutation"))
+      combined.includes("failed to find key") &&
+      combined.includes("decode mutation")
     ) {
       this.recovery.scheduleSyncRecovery(message);
     }
@@ -807,6 +812,23 @@ export class WhatsAppService {
 
   isAuthenticated(): boolean {
     return this.isAuthenticatedFlag;
+  }
+
+  /**
+   * Guard for tools that need a live, linked session. When the session has
+   * expired (or was never linked) this surfaces an explicit, actionable message
+   * in the MCP tool response instead of letting the caller hit an opaque
+   * socket/timeout failure.
+   */
+  private assertAuthenticated(): void {
+    if (!this.isAuthenticatedFlag) {
+      throw new Error(
+        "WhatsApp session is not authenticated — it has expired or was never linked. " +
+          "Nothing can be sent until it is re-linked: open the WhatsApp MCP admin page (/admin) " +
+          "and scan the QR from your phone (Settings → Linked Devices), then retry. " +
+          "Call check_auth_status to confirm once it reconnects.",
+      );
+    }
   }
 
   isReady(): boolean {
@@ -1460,6 +1482,7 @@ export class WhatsAppService {
     message: string,
     options?: { idempotencyKey?: string | null },
   ): Promise<any> {
+    this.assertAuthenticated();
     const socket = this.getSocket();
     const normalized = this.jidResolver.resolveLookupJid(jid);
     const isGroup = normalized.endsWith("@g.us");
@@ -1494,6 +1517,36 @@ export class WhatsAppService {
         "Suppressed duplicate WhatsApp send request",
       );
       return duplicate;
+    }
+    // For groups, make sure Baileys can resolve the group before we hand the
+    // send to its encrypt path. A wrong/truncated group JID (group JIDs end in a
+    // 10-digit creation timestamp) or an unsynced group makes that lookup return
+    // undefined, and Baileys then throws an opaque "Cannot read properties of
+    // undefined (reading 'id')". Best-effort: a group that yields no metadata id
+    // is rejected up front with an actionable message, while a transient/
+    // forbidden failure is logged and left to the send path's 403 retry below.
+    if (isGroup) {
+      try {
+        const meta = await socket.groupMetadata(normalized);
+        if (!meta || !meta.id) {
+          throw new Error(
+            `WhatsApp group ${normalized} returned no metadata — the JID is likely wrong ` +
+              `(group JIDs end in a 10-digit creation timestamp) or the group is not synced. ` +
+              `Verify it against list_chats, or run force_resync.`,
+          );
+        }
+      } catch (metaErr: any) {
+        if (
+          metaErr instanceof Error &&
+          metaErr.message.startsWith("WhatsApp group ")
+        ) {
+          throw metaErr;
+        }
+        log.warn(
+          { err: metaErr, jid: normalized },
+          "Group metadata prefetch failed; attempting send anyway",
+        );
+      }
     }
     const operationKey = idempotencyKey || dedupKey;
     try {
@@ -1559,6 +1612,19 @@ export class WhatsAppService {
         { err: error, jid: normalized },
         "Failed to send WhatsApp message",
       );
+      // Translate Baileys' opaque undefined-.id crash (an unresolved chat/group)
+      // into an actionable error instead of leaking "Cannot read properties of
+      // undefined (reading 'id')" to the caller.
+      if (
+        error instanceof TypeError &&
+        /reading '?id'?/.test(String(error?.message))
+      ) {
+        throw new Error(
+          `WhatsApp could not resolve the ${isGroup ? "group" : "chat"} ${normalized} while sending ` +
+            `(${error.message}). The JID is likely wrong or not synced — verify it with list_chats` +
+            `${isGroup ? " (group JIDs end in a 10-digit creation timestamp)" : ""}, or run force_resync.`,
+        );
+      }
       throw error;
     }
   }
@@ -1570,6 +1636,7 @@ export class WhatsAppService {
     asAudioMessage = false,
     options?: { idempotencyKey?: string | null; requestFingerprint?: string },
   ): Promise<any> {
+    this.assertAuthenticated();
     let buffer: Buffer;
     let mimetype = "application/octet-stream";
     let filename: string | undefined;
@@ -1654,6 +1721,7 @@ export class WhatsAppService {
     asAudioMessage = false,
     options?: { idempotencyKey?: string | null; requestFingerprint?: string },
   ): Promise<any> {
+    this.assertAuthenticated();
     const buffer = Buffer.from(base64, "base64");
     const content = await this.buildMediaMessage(
       buffer,

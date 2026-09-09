@@ -4,7 +4,6 @@ import { StoreService } from "../providers/store/store-service.js";
 export class WhatsAppSync {
   private warmupTimer: NodeJS.Timeout | null = null;
   private warmupAttempts = 0;
-  private forcedResync = false;
   private lastHistorySyncAt: number | null = null;
   private lastChatsSyncAt: number | null = null;
   private lastMessagesSyncAt: number | null = null;
@@ -86,7 +85,6 @@ export class WhatsAppSync {
   }
 
   async forceResync(resetAppState: () => Promise<void>) {
-    this.forcedResync = true;
     await resetAppState();
   }
 
@@ -110,13 +108,19 @@ export class WhatsAppSync {
 
       const chatCount = this.getChatCount();
       log.info({ chatCount }, "Warmup completed");
-      if (chatCount === 0 && !this.forcedResync && this.warmupAttempts >= 2) {
-        log.warn("Warmup still empty, forcing resync");
-        this.forcedResync = true;
-        if (onForceResync) {
-          await onForceResync();
-        }
+      // An empty chat store is NOT proof of corruption — a freshly-paired
+      // session is empty while it is still syncing, and a quiet account may
+      // legitimately have few chats. The gentle in-session `resyncAppState`
+      // above is the right tool; escalating to a full forceResync (destroy +
+      // reinit) here tore paired sessions down mid-sync and bounced them back
+      // to the QR screen. `onForceResync` is kept in the signature for the
+      // genuine corruption path (handleBaileysLogEvent), not fired on emptiness.
+      if (chatCount === 0 && this.warmupAttempts >= 2) {
+        log.info(
+          "Warmup still shows no chats; letting app-state sync settle (not forcing a reconnect)",
+        );
       }
+      void onForceResync;
     } catch (error) {
       log.warn({ err: error }, "Warmup failed");
     }
