@@ -458,24 +458,20 @@ export class WhatsAppService {
               .catch((err) =>
                 log.error({ err }, "Failed to reconnect WhatsApp"),
               );
-          } else if (
-            statusCode === 401 ||
-            reason?.includes("Connection Failure")
-          ) {
-            log.warn(
-              "WhatsApp connection failed. Resetting session and reconnecting.",
-            );
-            try {
-              fs.rmSync(this.sessionDir, { recursive: true, force: true });
-            } catch (_error) {
-              // Ignore
-            }
-            this.recovery
-              .reconnect()
-              .catch((err) =>
-                log.error({ err }, "Failed to reconnect WhatsApp"),
-              );
           } else {
+            // Everything that is not an explicit loggedOut is treated as
+            // transient and reconnects on the EXISTING credentials.
+            //
+            // This branch previously also wiped sessionDir when the reason
+            // string contained "Connection Failure". Baileys emits that text
+            // for ordinary server-side conditions -- 503 unavailableService,
+            // 428 connectionClosed, 408 connectionLost -- so a brief WhatsApp
+            // outage destroyed creds.json and every pre-key, forcing a QR
+            // re-scan every couple of days. The `statusCode === 401` half of
+            // that condition was dead code: DisconnectReason.loggedOut IS 401
+            // and is already handled by the branch above.
+            //
+            // Only a real loggedOut clears credentials now.
             this.recovery
               .reconnect()
               .catch((err) =>
